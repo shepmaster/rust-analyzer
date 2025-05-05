@@ -75,6 +75,7 @@ impl Definition {
         &self,
         sema: &Semantics<'_, RootDatabase>,
         new_name: &str,
+        skip_for_quick_hack: bool,
     ) -> Result<SourceChange> {
         // We append `r#` if needed.
         let new_name = new_name.trim_start_matches("r#");
@@ -103,8 +104,8 @@ impl Definition {
                 bail!("Cannot rename a builtin attr.")
             }
             Definition::SelfType(_) => bail!("Cannot rename `Self`"),
-            Definition::Macro(mac) => rename_reference(sema, Definition::Macro(mac), new_name),
-            def => rename_reference(sema, def, new_name),
+            Definition::Macro(mac) => rename_reference(sema, Definition::Macro(mac), new_name, false),
+            def => rename_reference(sema, def, new_name, skip_for_quick_hack),
         }
     }
 
@@ -328,6 +329,7 @@ fn rename_reference(
     sema: &Semantics<'_, RootDatabase>,
     def: Definition,
     new_name: &str,
+    skip_for_quick_hack: bool,
 ) -> Result<SourceChange> {
     let ident_kind = IdentifierKind::classify(new_name)?;
 
@@ -366,11 +368,13 @@ fn rename_reference(
             source_edit_from_references(references, def, new_name, file_id.edition(sema.db)),
         )
     }));
-
+    dbg!(&source_change);
     // This needs to come after the references edits, because we change the annotation of existing edits
     // if a conflict is detected.
-    let (file_id, edit) = source_edit_from_def(sema, def, new_name, &mut source_change)?;
-    source_change.insert_source_edit(file_id, edit);
+    if !skip_for_quick_hack {
+        let (file_id, edit) = source_edit_from_def(sema, def, new_name, &mut source_change)?;
+        source_change.insert_source_edit(file_id, edit);
+    }
     Ok(source_change)
 }
 

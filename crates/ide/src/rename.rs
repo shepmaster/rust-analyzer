@@ -34,7 +34,8 @@ pub(crate) fn prepare_rename(
     let syntax = source_file.syntax();
 
     let res = find_definitions(&sema, syntax, position)?
-        .map(|(frange, kind, def)| {
+        .filter(|(name, ..)| name.is_none())
+        .map(|(.., frange, kind, def)| {
             // ensure all ranges are valid
 
             if def.range_for_rename(&sema).is_none() {
@@ -128,7 +129,7 @@ pub(crate) fn rename(
             })
             .collect(),
         None => defs
-            .map(|(.., def)| {
+            .map(|(new_name2, .., def)| {
                 if let Definition::Local(local) = def {
                     if let Some(self_param) = local.as_self_param(sema.db) {
                         cov_mark::hit!(rename_self_to_param);
@@ -139,7 +140,11 @@ pub(crate) fn rename(
                         return rename_to_self(&sema, local);
                     }
                 }
-                def.rename(&sema, new_name)
+                let skip_for_quick_hack = new_name2.is_some();
+                let nn = new_name2.as_ref().map(|n| n.name.replace(&n.base, new_name));
+                let nn = nn.as_deref().unwrap_or(new_name);
+
+                def.rename(&sema, nn, skip_for_quick_hack)
             })
             .collect(),
     };
@@ -159,7 +164,7 @@ pub(crate) fn will_rename_file(
     let sema = Semantics::new(db);
     let module = sema.file_to_module_def(file_id)?;
     let def = Definition::Module(module);
-    let mut change = def.rename(&sema, new_name_stem).ok()?;
+    let mut change = def.rename(&sema, new_name_stem, false).ok()?;
     change.file_system_edits.clear();
     Some(change)
 }
@@ -196,17 +201,21 @@ fn alias_fallback(
     Some(builder.finish())
 }
 
+#[derive(Debug)]
+struct Q { base: String, name: String }
+
 fn find_definitions(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
     FilePosition { file_id, offset }: FilePosition,
-) -> RenameResult<impl Iterator<Item = (FileRange, SyntaxKind, Definition)>> {
+) -> RenameResult<impl Iterator<Item = (Option<Q>, FileRange, SyntaxKind, Definition)>> {
     let token = syntax.token_at_offset(offset).find(|t| matches!(t.kind(), SyntaxKind::STRING));
 
     if let Some((range, Some(resolution))) =
         token.and_then(|token| sema.check_for_format_args_template(token, offset))
     {
         return Ok(vec![(
+            None,
             FileRange { file_id, range },
             SyntaxKind::STRING,
             Definition::from(resolution),
@@ -214,12 +223,28 @@ fn find_definitions(
         .into_iter());
     }
 
+    // JPG: What happens if we trigger a rename on *not* the defining usage?
+    let token = syntax.token_at_offset(offset).find(|t| matches!(t.kind(), SyntaxKind::IDENT));
+
     let symbols =
-        sema.find_nodes_at_offset_with_descend::<ast::NameLike>(syntax, offset).map(|name_like| {
+        sema.find_nodes_at_offset_with_descend2::<ast::NameLike>(syntax, offset).map(|name_like| {
             let kind = name_like.syntax().kind();
             let range = sema
                 .original_range_opt(name_like.syntax())
                 .ok_or_else(|| format_err!("No references found at position"))?;
+
+            let mut new_name = None;
+            if let Some(token) = &token {
+                let base_name = token.text();
+                let related_name = name_like.text();
+                let related_name = related_name.as_str();
+                dbg!(base_name, related_name, range);
+                if base_name != related_name {
+                    new_name = Some(Q { base: base_name.to_string(), name: related_name.to_string() });
+                }
+            }
+
+
             let res = match &name_like {
                 // renaming aliases would rename the item being aliased as the HIR doesn't track aliases yet
                 ast::NameLike::Name(name)
@@ -284,7 +309,7 @@ fn find_definitions(
                         .ok_or_else(|| format_err!("No references found at position"))
                 }
             };
-            res.map(|def| (range, kind, def))
+            res.map(|def| (new_name, range, kind, def))
         });
 
     let res: RenameResult<Vec<_>> = symbols.collect();
@@ -297,7 +322,7 @@ fn find_definitions(
                 // remove duplicates, comparing `Definition`s
                 Ok(v.into_iter()
                     .unique_by(|&(.., def)| def)
-                    .map(|(a, b, c)| (a.into_file_id(sema.db), b, c))
+                    .map(|(n, a, b, c)| (n, a.into_file_id(sema.db), b, c))
                     .collect::<Vec<_>>()
                     .into_iter())
             }
@@ -3260,6 +3285,28 @@ trait Trait<U> {
     fn foo() -> impl use<U> Trait {}
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn rename_macro_generated_type_with_a_suffix() {
+        check(
+            "Bar",
+            r#"
+//- proc_macros: generate_suffixed_type
+#[proc_macros::generate_suffixed_type]
+struct Foo$0;
+
+fn usage(_: FooSuffix) {}
+usage(FooSuffix);
+"#,
+            r#"
+#[proc_macros::generate_suffixed_type]
+struct Bar;
+
+fn usage(_: BarSuffix) {}
+usage(BarSuffix);
+"#
         );
     }
 }

@@ -202,6 +202,15 @@ impl<DB: HirDatabase> Semantics<'_, DB> {
         self.imp.descend_node_at_offset(node, offset).filter_map(|mut it| it.find_map(N::cast))
     }
 
+    // TODO: Should this be inlined to the caller?
+    pub fn find_nodes_at_offset_with_descend2<'slf, N: AstNode + 'slf>(
+        &'slf self,
+        node: &SyntaxNode,
+        offset: TextSize,
+    ) -> impl Iterator<Item = N> + 'slf {
+        self.imp.descend_node_at_offset2(node, offset).filter_map(|mut it| it.find_map(N::cast))
+    }
+
     pub fn resolve_range_pat(&self, range_pat: &ast::RangePat) -> Option<Struct> {
         self.imp.resolve_range_pat(range_pat).map(Struct::from)
     }
@@ -952,6 +961,27 @@ impl<'db> SemanticsImpl<'db> {
         r
     }
 
+    /// TODO: Descends the token into expansions, returning the tokens that matches the input
+    /// token's [`SyntaxKind`] and text.
+    pub fn descend_into_macros_inexact(&self, token: SyntaxToken) -> SmallVec<[SyntaxToken; 1]> {
+        let mut r = smallvec![];
+        let kind = token.kind();
+
+        self.descend_into_macros_cb(token.clone(), |InFile { value, file_id: _ }, ctx| {
+            let mapped_kind = value.kind();
+            let any_ident_match = || kind.is_any_identifier() && value.kind().is_any_identifier();
+            let matches = (kind == mapped_kind || any_ident_match())
+                && !ctx.is_opaque(self.db);
+            if matches {
+                r.push(value);
+            }
+        });
+        if r.is_empty() {
+            r.push(token);
+        }
+        r
+    }
+
     /// Descends the token into expansions, returning the first token that matches the input
     /// token's [`SyntaxKind`] and text.
     pub fn descend_into_macros_single_exact(&self, token: SyntaxToken) -> SyntaxToken {
@@ -1225,6 +1255,25 @@ impl<'db> SemanticsImpl<'db> {
             })
             // re-order the tokens from token_at_offset by returning the ancestors with the smaller first nodes first
             // See algo::ancestors_at_offset, which uses the same approach
+            .kmerge_by(|left, right| {
+                left.clone()
+                    .map(|node| node.text_range().len())
+                    .lt(right.clone().map(|node| node.text_range().len()))
+            })
+    }
+
+    fn descend_node_at_offset2(
+        &self,
+        node: &SyntaxNode,
+        offset: TextSize,
+    ) -> impl Iterator<Item = impl Iterator<Item = SyntaxNode> + '_> + '_ {
+        node.token_at_offset(offset)
+            .map(move |token| self.descend_into_macros_inexact(token))
+            .map(|descendants| {
+                descendants.into_iter().map(move |it| self.token_ancestors_with_macros(it))
+            })
+        // re-order the tokens from token_at_offset by returning the ancestors with the smaller first nodes first
+        // See algo::ancestors_at_offset, which uses the same approach
             .kmerge_by(|left, right| {
                 left.clone()
                     .map(|node| node.text_range().len())
